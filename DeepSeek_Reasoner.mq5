@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                              DeepSeek_Reasoner.mq5 |
-//|                                 Copyright 2026, Claude TradingView |
-//|                                            https://www.example.com |
+//|                                 Copyright 2026, DeepTrading |
+//|                                            https://www.deeptrading.com |
 //+------------------------------------------------------------------+
-#property copyright "Copyright 2026, Claude TradingView"
-#property link      "https://www.example.com"
+#property copyright "Copyright 2026, DeepTrading"
+#property link      "https://www.deeptrading.com"
 #property version   "1.00"
 // #property strict // MQL4 directive, not needed in MQL5
 
