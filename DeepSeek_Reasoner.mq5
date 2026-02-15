@@ -6,7 +6,6 @@
 #property copyright "Copyright 2026, DeepTrading"
 #property link      "https://www.deeptrading.com"
 #property version   "1.00"
-// #property strict // MQL4 directive, not needed in MQL5
 
 //--- Input Parameters
 input int      FastEMA_Period = 9;          // Fast EMA Period
@@ -15,8 +14,8 @@ input double   LotSize = 0.01;              // Lot Size (0.01 for XAUUSD)
 input double   ATR_Multiplier = 2.0;        // ATR Multiplier for Stop Loss
 input double   RiskReward_Ratio = 2.5;      // Risk:Reward Ratio
 input int      ATR_Period = 14;             // ATR Period
-input long     MagicNumber = 123456;        // Magic Number for trades (use long for MQL5)
-input double   MaximumRisk = 2.0;           // Maximum risk percentage (2%) - changed to 2.0 for proper percentage
+input long     MagicNumber = 123456;        // Magic Number for trades
+input double   MaximumRisk = 2.0;           // Maximum risk percentage (2%)
 input double   DecreaseFactor = 3;          // Decrease factor for lot sizing
 
 //--- Global Variables
@@ -45,10 +44,10 @@ int OnInit()
       return(INIT_PARAMETERS_INCORRECT);
    }
    
-   //--- Create indicator handles
-   FastEMA_Handle = iMA(_Symbol, _Period, FastEMA_Period, 0, MODE_EMA, PRICE_CLOSE);
-   SlowEMA_Handle = iMA(_Symbol, _Period, SlowEMA_Period, 0, MODE_EMA, PRICE_CLOSE);
-   ATR_Handle = iATR(_Symbol, _Period, ATR_Period);
+   //--- Create indicator handles (FIXED: Using PERIOD_CURRENT instead of _Period)
+   FastEMA_Handle = iMA(_Symbol, PERIOD_CURRENT, FastEMA_Period, 0, MODE_EMA, PRICE_CLOSE);
+   SlowEMA_Handle = iMA(_Symbol, PERIOD_CURRENT, SlowEMA_Period, 0, MODE_EMA, PRICE_CLOSE);
+   ATR_Handle = iATR(_Symbol, PERIOD_CURRENT, ATR_Period);
    
    if(FastEMA_Handle == INVALID_HANDLE || SlowEMA_Handle == INVALID_HANDLE || ATR_Handle == INVALID_HANDLE)
    {
@@ -63,6 +62,7 @@ int OnInit()
    
    //--- Set magic number for trades
    Print("Expert Advisor initialized successfully");
+   Print("Symbol: ", _Symbol, ", Period: ", EnumToString(PERIOD_CURRENT));
    return(INIT_SUCCEEDED);
 }
 
@@ -86,7 +86,7 @@ void OnTick()
 {
    //--- Check for new bar
    static datetime lastBarTime = 0;
-   datetime currentBarTime = iTime(_Symbol, _Period, 0);
+   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
    
    if(lastBarTime == currentBarTime)
       return; // Same bar, skip processing
@@ -189,6 +189,19 @@ bool GenerateShortSignal()
 }
 
 //+------------------------------------------------------------------+
+//| Get filling mode for orders                                      |
+//+------------------------------------------------------------------+
+ENUM_ORDER_TYPE_FILLING GetFillingMode()
+{
+   uint filling = (uint)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+   if((filling & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK) 
+      return ORDER_FILLING_FOK;
+   if((filling & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC) 
+      return ORDER_FILLING_IOC;
+   return ORDER_FILLING_RETURN;
+}
+
+//+------------------------------------------------------------------+
 //| Open long position                                               |
 //+------------------------------------------------------------------+
 void OpenLongPosition()
@@ -229,7 +242,7 @@ void OpenLongPosition()
    request.deviation = 10;
    request.magic = MagicNumber;
    request.comment = "DeepSeek Reasoner Long";
-   request.type_filling = ORDER_FILLING_FOK; // Fill or Kill
+   request.type_filling = GetFillingMode(); // FIXED: Auto-detect filling mode
    
    //--- Send order
    if(OrderSend(request, result))
@@ -292,7 +305,7 @@ void OpenShortPosition()
    request.deviation = 10;
    request.magic = MagicNumber;
    request.comment = "DeepSeek Reasoner Short";
-   request.type_filling = ORDER_FILLING_FOK; // Fill or Kill
+   request.type_filling = GetFillingMode(); // FIXED: Auto-detect filling mode
    
    //--- Send order
    if(OrderSend(request, result))
@@ -340,21 +353,23 @@ double CalculateLotSize(double baseLot)
       double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
       double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
       
-      //--- Calculate approximate stop loss distance in points
-      // Note: This is a simplified calculation - actual stop loss distance depends on entry price
-      // and will be calculated properly in OpenLongPosition/OpenShortPosition functions
-      double atr = ATR_Buffer[0];
-      double stopLossDistancePoints = (atr * ATR_Multiplier) / point;
-      
-      if(stopLossDistancePoints <= 0 || tickValue <= 0 || point <= 0)
+      if(tickSize == 0 || tickValue == 0 || point == 0)
       {
-         Print("Warning: Invalid stop loss distance or symbol properties, using base lot size");
+         Print("Warning: Failed to get symbol properties, using base lot size");
          return NormalizeDouble(baseLot, 2);
       }
       
-      //--- Calculate lot size based on risk amount, stop loss distance, and tick value
-      // Formula: Lot size = Risk amount / (Stop loss in points × Point value per lot)
-      // Point value per lot = Tick value × (Tick size / Point)
+      //--- Calculate approximate stop loss distance in points
+      double atr = ATR_Buffer[0];
+      double stopLossDistancePoints = (atr * ATR_Multiplier) / point;
+      
+      if(stopLossDistancePoints <= 0)
+      {
+         Print("Warning: Invalid stop loss distance, using base lot size");
+         return NormalizeDouble(baseLot, 2);
+      }
+      
+      //--- Calculate lot size based on risk amount
       double pointValuePerLot = tickValue * (tickSize / point);
       double calculatedLot = riskAmount / (stopLossDistancePoints * pointValuePerLot);
       
@@ -373,6 +388,12 @@ double CalculateLotSize(double baseLot)
       double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
       double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
       double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+      
+      if(minLot == 0 || maxLot == 0 || lotStep == 0)
+      {
+         Print("Warning: Failed to get lot size limits, using base lot size");
+         return NormalizeDouble(baseLot, 2);
+      }
       
       if(calculatedLot < minLot) calculatedLot = minLot;
       if(calculatedLot > maxLot) calculatedLot = maxLot;
@@ -394,8 +415,13 @@ int CountLosingTrades()
    int losingCount = 0;
    datetime currentTime = TimeCurrent();
    
-   //--- Look at recent trades in history (last 100 trades)
-   HistorySelect(currentTime - 86400, currentTime); // Last 24 hours
+   //--- Look at recent trades in history (last 24 hours)
+   if(!HistorySelect(currentTime - 86400, currentTime))
+   {
+      Print("Warning: Failed to select history");
+      return 0;
+   }
+   
    int totalHistory = HistoryDealsTotal();
    
    //--- Count consecutive losing trades with our magic number
@@ -448,9 +474,10 @@ double NormalizePrice(double price)
 //+------------------------------------------------------------------+
 bool ValidateStopLossTakeprofit(ENUM_ORDER_TYPE orderType, double price, double sl, double tp)
 {
-   //--- Check if SL and TP are valid distances from price
-   double stopLevel = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
-   double freezeLevel = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL) * _Point;
+   //--- Get stop level
+   double stopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+   
+   if(stopLevel == 0) stopLevel = 10 * _Point; // Default if broker allows zero
    
    //--- For buy orders
    if(orderType == ORDER_TYPE_BUY)
@@ -458,13 +485,15 @@ bool ValidateStopLossTakeprofit(ENUM_ORDER_TYPE orderType, double price, double 
       // Stop loss must be below current price
       if(sl >= price - stopLevel)
       {
-         Print("Error: Stop loss too close to price for buy order. Price: ", price, " SL: ", sl, " Stop level: ", stopLevel);
+         Print("Error: Stop loss too close to price for buy order. Price: ", price, 
+               " SL: ", sl, " Required distance: ", stopLevel);
          return false;
       }
       // Take profit must be above current price
       if(tp <= price + stopLevel)
       {
-         Print("Error: Take profit too close to price for buy order. Price: ", price, " TP: ", tp, " Stop level: ", stopLevel);
+         Print("Error: Take profit too close to price for buy order. Price: ", price, 
+               " TP: ", tp, " Required distance: ", stopLevel);
          return false;
       }
    }
@@ -474,27 +503,20 @@ bool ValidateStopLossTakeprofit(ENUM_ORDER_TYPE orderType, double price, double 
       // Stop loss must be above current price
       if(sl <= price + stopLevel)
       {
-         Print("Error: Stop loss too close to price for sell order. Price: ", price, " SL: ", sl, " Stop level: ", stopLevel);
+         Print("Error: Stop loss too close to price for sell order. Price: ", price, 
+               " SL: ", sl, " Required distance: ", stopLevel);
          return false;
       }
       // Take profit must be below current price
       if(tp >= price - stopLevel)
       {
-         Print("Error: Take profit too close to price for sell order. Price: ", price, " TP: ", tp, " Stop level: ", stopLevel);
+         Print("Error: Take profit too close to price for sell order. Price: ", price, 
+               " TP: ", tp, " Required distance: ", stopLevel);
          return false;
       }
    }
    
    return true;
-}
-
-//+------------------------------------------------------------------+
-//| Check for close conditions (optional - for manual closing)       |
-//+------------------------------------------------------------------+
-void CheckForClose()
-{
-   // This function can be expanded to implement additional exit conditions
-   // Currently exits are handled by stop loss and take profit only
 }
 
 //+------------------------------------------------------------------+
