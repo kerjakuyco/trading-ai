@@ -1,0 +1,314 @@
+// This Pine Script™ source code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+
+//@version=5
+indicator("Structure Trade — SMC Liquidity Sweep", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// INPUTS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+g_struct  = "Structure Settings"
+pivotLen  = input.int(5,     "Pivot Lookback",          group=g_struct, minval=2, maxval=20, tooltip="Higher = fewer but stronger structure levels")
+bosConf   = input.int(1,     "BOS Candle Close Confirm", group=g_struct, minval=1, maxval=3, tooltip="Candles that must close beyond level")
+
+g_liq     = "Liquidity Sweep"
+sweepWick = input.float(0.5, "Min Wick Ratio",          group=g_liq, step=0.1, minval=0.1, maxval=0.9, tooltip="Wick must be at least this % of candle range to count as sweep")
+sweepBars = input.int(3,     "Sweep Lookback Bars",     group=g_liq, minval=1, maxval=10, tooltip="How many bars back to check for sweep + reclaim")
+
+g_fvg     = "Fair Value Gap (FVG)"
+showFVG   = input.bool(true, "Show FVGs",               group=g_fvg)
+fvgMinAtr = input.float(0.3, "FVG Min Size (× ATR)",    group=g_fvg, step=0.1, tooltip="Filter tiny FVGs")
+
+g_htf     = "HTF Trend Filter"
+useHTF    = input.bool(true, "Use HTF Trend Filter",    group=g_htf)
+htfTF     = input.timeframe("D", "HTF Timeframe",       group=g_htf)
+htfEmaLen = input.int(50,   "HTF EMA Length",           group=g_htf)
+
+g_risk    = "Risk Management"
+atrLen    = input.int(14,   "ATR Length",               group=g_risk)
+slBuffer  = input.float(0.3, "SL Buffer (× ATR)",      group=g_risk, step=0.1)
+rrRatio   = input.float(2.5, "Risk : Reward",           group=g_risk, step=0.1)
+
+g_vis     = "Visuals"
+showSR    = input.bool(true, "Show S/R Levels",         group=g_vis)
+showBOS   = input.bool(true, "Show BOS Labels",         group=g_vis)
+showSweep = input.bool(true, "Show Sweep Labels",       group=g_vis)
+showSLTP  = input.bool(true, "Show SL / TP Lines",      group=g_vis)
+showDash  = input.bool(true, "Show Dashboard",          group=g_vis)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// CORE CALCULATIONS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+atr = ta.atr(atrLen)
+
+// HTF trend
+htfEma    = request.security(syminfo.tickerid, htfTF, ta.ema(close, htfEmaLen), lookahead=barmerge.lookahead_off)
+htfClose  = request.security(syminfo.tickerid, htfTF, close, lookahead=barmerge.lookahead_off)
+htfBull   = htfClose > htfEma
+htfBear   = htfClose < htfEma
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// PIVOT-BASED STRUCTURE (Swing Highs / Lows)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+pivotHigh = ta.pivothigh(high, pivotLen, pivotLen)
+pivotLow  = ta.pivotlow(low, pivotLen, pivotLen)
+
+var float lastSwingHigh   = na
+var float lastSwingLow    = na
+var int   lastSwingHighBI = na
+var int   lastSwingLowBI  = na
+var float prevSwingHigh   = na
+var float prevSwingLow    = na
+
+if not na(pivotHigh)
+    prevSwingHigh   := lastSwingHigh
+    lastSwingHigh   := pivotHigh
+    lastSwingHighBI := bar_index - pivotLen
+
+if not na(pivotLow)
+    prevSwingLow    := lastSwingLow
+    lastSwingLow    := pivotLow
+    lastSwingLowBI  := bar_index - pivotLen
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// BREAK OF STRUCTURE (BOS) / CHANGE OF CHARACTER (CHoCH)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var int   structureBias   = 0   // 1 = bullish, -1 = bearish
+var float bosLevel        = na
+var int   bosBar          = na
+
+bullBOS = not na(lastSwingHigh) and close > lastSwingHigh and close[1] <= lastSwingHigh
+bearBOS = not na(lastSwingLow)  and close < lastSwingLow  and close[1] >= lastSwingLow
+
+// CHoCH = BOS against current bias
+bullCHoCH = bullBOS and structureBias == -1
+bearCHoCH = bearBOS and structureBias == 1
+
+if bullBOS
+    structureBias := 1
+    bosLevel      := lastSwingHigh
+    bosBar        := bar_index
+    if showBOS
+        label.new(bar_index, low, bullCHoCH ? "CHoCH ▲" : "BOS ▲", 
+             style=label.style_label_up, 
+             color=bullCHoCH ? color.new(#ffd600, 0) : color.new(#00c853, 20), 
+             textcolor=bullCHoCH ? color.black : color.white, 
+             size=size.tiny)
+
+if bearBOS
+    structureBias := -1
+    bosLevel      := lastSwingLow
+    bosBar        := bar_index
+    if showBOS
+        label.new(bar_index, high, bearCHoCH ? "CHoCH ▼" : "BOS ▼", 
+             style=label.style_label_down, 
+             color=bearCHoCH ? color.new(#ffd600, 0) : color.new(#ff1744, 20), 
+             textcolor=bearCHoCH ? color.black : color.white, 
+             size=size.tiny)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// S/R ZONES from Swing Points
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var box resistBox = na
+var box supportBox = na
+
+if not na(pivotHigh) and showSR
+    if not na(resistBox)
+        box.delete(resistBox)
+    resistBox := box.new(bar_index - pivotLen, pivotHigh + atr * 0.1, bar_index + 50, pivotHigh - atr * 0.1, 
+         bgcolor=color.new(#ff1744, 88), border_color=color.new(#ff1744, 60), border_width=1)
+
+if not na(pivotLow) and showSR
+    if not na(supportBox)
+        box.delete(supportBox)
+    supportBox := box.new(bar_index - pivotLen, pivotLow + atr * 0.1, bar_index + 50, pivotLow - atr * 0.1, 
+         bgcolor=color.new(#00c853, 88), border_color=color.new(#00c853, 60), border_width=1)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// LIQUIDITY SWEEP DETECTION
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+candleRange  = high - low
+upperWick    = high - math.max(open, close)
+lowerWick    = math.min(open, close) - low
+bodyMid      = (open + close) / 2
+
+// Bullish sweep: price wicks below swing low then closes back above it
+bullSweep = false
+for i = 0 to sweepBars - 1
+    if not na(lastSwingLow) and low[i] < lastSwingLow and close > lastSwingLow
+        wickRatio = lowerWick / math.max(candleRange, syminfo.mintick)
+        if wickRatio >= sweepWick
+            bullSweep := true
+            break
+
+// Bearish sweep: price wicks above swing high then closes back below it
+bearSweep = false
+for i = 0 to sweepBars - 1
+    if not na(lastSwingHigh) and high[i] > lastSwingHigh and close < lastSwingHigh
+        wickRatio = upperWick / math.max(candleRange, syminfo.mintick)
+        if wickRatio >= sweepWick
+            bearSweep := true
+            break
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// FAIR VALUE GAPS (FVG)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+bullFVG = low > high[2] and (low - high[2]) > atr * fvgMinAtr
+bearFVG = high < low[2] and (low[2] - high) > atr * fvgMinAtr
+
+if bullFVG and showFVG
+    box.new(bar_index - 1, low, bar_index + 20, high[2], 
+         bgcolor=color.new(#00c853, 90), border_color=color.new(#00c853, 70), border_width=1)
+
+if bearFVG and showFVG
+    box.new(bar_index - 1, low[2], bar_index + 20, high, 
+         bgcolor=color.new(#ff1744, 90), border_color=color.new(#ff1744, 70), border_width=1)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ENTRY SIGNALS — Structure + Sweep + HTF Confluence
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Confluence scoring
+var int longConf  = 0
+var int shortConf = 0
+
+longConf  := 0
+shortConf := 0
+
+// 1. Structure bias
+longConf  += structureBias == 1  ? 1 : 0
+shortConf += structureBias == -1 ? 1 : 0
+
+// 2. Liquidity sweep
+longConf  += bullSweep ? 1 : 0
+shortConf += bearSweep ? 1 : 0
+
+// 3. HTF trend alignment
+longConf  += (useHTF and htfBull) or not useHTF ? 1 : 0
+shortConf += (useHTF and htfBear) or not useHTF ? 1 : 0
+
+// 4. FVG present nearby (within last 10 bars)
+hasBullFVG = false
+hasBearFVG = false
+for i = 0 to 9
+    if low[i] > high[i + 2] and (low[i] - high[i + 2]) > atr * fvgMinAtr
+        hasBullFVG := true
+    if high[i] < low[i + 2] and (low[i + 2] - high[i]) > atr * fvgMinAtr
+        hasBearFVG := true
+
+longConf  += hasBullFVG ? 1 : 0
+shortConf += hasBearFVG ? 1 : 0
+
+// ━━━ ENTRY CONDITIONS ━━━
+// Core: must have sweep. Then check confluence.
+longEntry  = bullSweep and longConf  >= 3
+shortEntry = bearSweep and shortConf >= 3
+
+// Cooldown — prevent duplicate signals
+var int lastLongBar  = 0
+var int lastShortBar = 0
+cooldown = pivotLen * 2
+
+longEntry  := longEntry  and (bar_index - lastLongBar  > cooldown)
+shortEntry := shortEntry and (bar_index - lastShortBar > cooldown)
+
+if longEntry
+    lastLongBar := bar_index
+
+if shortEntry
+    lastShortBar := bar_index
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// SIGNAL LABELS & SL/TP
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if longEntry and showSweep
+    label.new(bar_index, low, "⟡ LONG\nSweep + " + str.tostring(longConf) + "/4",
+         style=label.style_label_up, color=color.new(#00c853, 0),
+         textcolor=color.white, size=size.small)
+    if showSLTP
+        sl = low - atr * slBuffer
+        tp = close + (close - sl) * rrRatio
+        line.new(bar_index, sl, bar_index + 30, sl, color=color.new(#ff1744, 40), style=line.style_dashed, width=1)
+        line.new(bar_index, tp, bar_index + 30, tp, color=color.new(#00e676, 40), style=line.style_dashed, width=1)
+        label.new(bar_index + 15, sl, "SL " + str.tostring(sl, format.mintick), style=label.style_none, textcolor=#ff1744, size=size.tiny)
+        label.new(bar_index + 15, tp, "TP " + str.tostring(tp, format.mintick), style=label.style_none, textcolor=#00e676, size=size.tiny)
+
+if shortEntry and showSweep
+    label.new(bar_index, high, "⟡ SHORT\nSweep + " + str.tostring(shortConf) + "/4",
+         style=label.style_label_down, color=color.new(#ff1744, 0),
+         textcolor=color.white, size=size.small)
+    if showSLTP
+        sl = high + atr * slBuffer
+        tp = close - (sl - close) * rrRatio
+        line.new(bar_index, sl, bar_index + 30, sl, color=color.new(#ff1744, 40), style=line.style_dashed, width=1)
+        line.new(bar_index, tp, bar_index + 30, tp, color=color.new(#00e676, 40), style=line.style_dashed, width=1)
+        label.new(bar_index + 15, sl, "SL " + str.tostring(sl, format.mintick), style=label.style_none, textcolor=#ff1744, size=size.tiny)
+        label.new(bar_index + 15, tp, "TP " + str.tostring(tp, format.mintick), style=label.style_none, textcolor=#00e676, size=size.tiny)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// BAR COLORING
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+barcolor(longEntry ? color.new(#00c853, 0) : shortEntry ? color.new(#ff1744, 0) : na)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ALERTS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+alertcondition(longEntry,  "Long — Liquidity Sweep",  "⟡ LONG: Bullish sweep + structure confluence")
+alertcondition(shortEntry, "Short — Liquidity Sweep", "⟡ SHORT: Bearish sweep + structure confluence")
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// DASHBOARD
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if showDash and barstate.islast
+    var table dash = table.new(position.top_right, 2, 8,
+         bgcolor=color.new(#1a1a2e, 5), border_width=1, border_color=color.new(#333333, 0))
+
+    table.cell(dash, 0, 0, "STRUCTURE",       text_color=color.gray,  text_size=size.small)
+    table.cell(dash, 1, 0, "STATUS",           text_color=color.gray,  text_size=size.small)
+
+    // Market structure
+    table.cell(dash, 0, 1, "Bias",             text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 1, structureBias == 1 ? "🟢 BULLISH" : structureBias == -1 ? "🔴 BEARISH" : "— NEUTRAL",
+         text_color=structureBias == 1 ? #00c853 : structureBias == -1 ? #ff1744 : color.gray, text_size=size.small)
+
+    // HTF
+    table.cell(dash, 0, 2, "HTF (" + htfTF + ")",  text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 2, htfBull ? "🟢 BULL" : "🔴 BEAR",
+         text_color=htfBull ? #00c853 : #ff1744, text_size=size.small)
+
+    // Last swing high
+    table.cell(dash, 0, 3, "Swing High",      text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 3, not na(lastSwingHigh) ? str.tostring(lastSwingHigh, format.mintick) : "—",
+         text_color=#ff9800, text_size=size.small)
+
+    // Last swing low
+    table.cell(dash, 0, 4, "Swing Low",       text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 4, not na(lastSwingLow) ? str.tostring(lastSwingLow, format.mintick) : "—",
+         text_color=#00bcd4, text_size=size.small)
+
+    // Sweep status
+    table.cell(dash, 0, 5, "Sweep",           text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 5, bullSweep ? "⟡ BULL SWEEP" : bearSweep ? "⟡ BEAR SWEEP" : "— None",
+         text_color=bullSweep ? #00c853 : bearSweep ? #ff1744 : color.gray, text_size=size.small)
+
+    // FVG
+    table.cell(dash, 0, 6, "FVG",             text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 6, hasBullFVG ? "🟢 Bull Gap" : hasBearFVG ? "🔴 Bear Gap" : "— None",
+         text_color=hasBullFVG ? #00c853 : hasBearFVG ? #ff1744 : color.gray, text_size=size.small)
+
+    // Signal
+    table.cell(dash, 0, 7, "Signal",          text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 7, longEntry ? "⟡ LONG " + str.tostring(longConf) + "/4" :
+         shortEntry ? "⟡ SHORT " + str.tostring(shortConf) + "/4" : "— WAIT",
+         text_color=longEntry ? #00c853 : shortEntry ? #ff1744 : color.gray, text_size=size.small)
